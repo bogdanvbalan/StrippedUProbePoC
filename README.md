@@ -20,14 +20,6 @@ This technique is relevant for scenarios where you need to instrument production
     * Attempt to attach the eBPF probes to the **stripped** binary using the provided offsets.
 6.  **Verification:** The `run_poc.sh` script orchestrates the build and offset discovery, then provides instructions for manually running the Go loader, the trace pipe monitor, and the stripped C program to observe if the hooks trigger.
 
-## Current Status & Important Findings (As of POC Development)
-
-* **Kernel Support Confirmed:** Using the standard Linux `perf probe -x <stripped_binary> <offset>` command **successfully attaches** probes by offset to the stripped binary. This confirms the Linux kernel *can* perform this operation.
-* **`bpftrace` Works:** Using `bpftrace` with the `<stripped_binary>:<0xOFFSET>` syntax also **successfully attaches** probes and intercepts function calls, further validating the core concept at the kernel level. (See "Validation with bpftrace" section below).
-* **`cilium/ebpf` Library Issue:** The current Go loader implementation using `cilium/ebpf`'s `Executable.Uprobe` function **fails** to attach probes by offset to the stripped, non-PIE binary. It returns misleading "symbol ... not found" errors, even though the binary has no symbols and `perf probe` works. This suggests a **bug or limitation within the `cilium/ebpf` library** specifically for this scenario (offset attachment on stripped non-PIE executables). Attempts to use different variations (`link.AttachUprobe` - which doesn't exist, providing dummy symbols) also failed.
-
-Therefore, while this POC demonstrates the *setup* for offset-based probing, the Go loader part currently fails due to suspected library issues. The underlying *concept*, however, is valid as proven by `perf` and `bpftrace`.
-
 ## Components
 
 * `dummy_ssl.c`: Simple C program simulating target functions.
@@ -89,25 +81,3 @@ The `run_poc.sh` script will print these instructions after a successful build:
     ./dummy_ssl_stripped
     ```
     Press Enter when prompted.
-
-## Expected Outcome (Using Go Loader)
-
-Currently, the Go loader (`sudo ./ebpf_loader ...`) is expected to **fail** during the probe attachment phase with an error similar to:
-`Attaching uprobe to read offset 0x... (symbol _start): symbol _start: not found`
-This failure occurs despite `perf probe` working, indicating an issue within the `cilium/ebpf` library's handling of this specific scenario.
-
-## Validation with `bpftrace` (Shows Concept Works)
-
-To confirm the offsets are correct and the kernel *can* hook them, you can bypass the Go loader and use `bpftrace`:
-
-1.  **Terminal 1:** Run `bpftrace` with the offsets (replace `<FULL_PATH_TO>` with the actual path):
-    ```bash
-    sudo bpftrace -e 'uprobe:<FULL_PATH_TO>/dummy_ssl_stripped:0x<offset_read> { printf("bpftrace: READ Entry (offset)\\n"); } uprobe:<FULL_PATH_TO>/dummy_ssl_stripped:0x<offset_write> { printf("bpftrace: WRITE Entry (offset)\\n"); } uretprobe:<FULL_PATH_TO>/dummy_ssl_stripped:0x<offset_write> { printf("bpftrace: WRITE Exit (offset)\\n"); }'
-    ```
-2.  **Terminal 2:** Run the stripped C program:
-    ```bash
-    ./dummy_ssl_stripped
-    ```
-    Press Enter when prompted.
-
-3.  **Observe Terminal 1:** You **should** see the "bpftrace: ..." messages printed when the C program calls the functions, demonstrating the offset-based hooking works at the kernel level.
