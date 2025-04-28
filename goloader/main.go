@@ -57,8 +57,9 @@ func main() {
 	}
 
 	log.Printf("Attaching uprobe READ using offset + dummy symbol...")
-	upRead, err := ex.Uprobe("_start", objs.UprobeReadEntry, &link.UprobeOptions{
-		Offset: offsetRead,
+	upRead, err := ex.Uprobe("", objs.UprobeReadEntry, &link.UprobeOptions{
+		Address: offsetRead,
+		Offset:  0,
 	})
 	if err != nil {
 		log.Fatalf("Attaching uprobe to read offset 0x%x (symbol _start): %v", offsetRead, err)
@@ -67,8 +68,9 @@ func main() {
 	log.Printf("Attached uprobe to dummy_SSL_read at offset 0x%x", offsetRead)
 
 	log.Printf("Attaching uprobe WRITE using offset + dummy symbol...")
-	upWrite, err := ex.Uprobe("_start", objs.UprobeWriteEntry, &link.UprobeOptions{
-		Offset: offsetWrite,
+	upWrite, err := ex.Uprobe("", objs.UprobeWriteEntry, &link.UprobeOptions{
+		Address: offsetWrite,
+		Offset:  0,
 	})
 	if err != nil {
 		log.Fatalf("Attaching uprobe to write offset 0x%x (symbol _start): %v", offsetWrite, err)
@@ -77,8 +79,9 @@ func main() {
 	log.Printf("Attached uprobe to dummy_SSL_write entry at offset 0x%x", offsetWrite)
 
 	log.Printf("Attaching uretprobe WRITE using offset + dummy symbol...")
-	urpWrite, err := ex.Uretprobe("_start", objs.UretprobeWriteExit, &link.UprobeOptions{
-		Offset: offsetWrite,
+	urpWrite, err := ex.Uretprobe("", objs.UretprobeWriteExit, &link.UprobeOptions{
+		Address: offsetWrite,
+		Offset:  0,
 	})
 	if err != nil {
 		log.Fatalf("Attaching uretprobe to write offset 0x%x (symbol _start): %v", offsetWrite, err)
