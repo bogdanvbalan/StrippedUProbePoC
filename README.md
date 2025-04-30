@@ -10,14 +10,15 @@ This technique is relevant for scenarios where you need to instrument production
 
 1.  **Target Simulation:** A simple C program (`dummy_ssl.c`) simulates target functions (`dummy_SSL_read`, `dummy_SSL_write`) we might want to trace in a real application.
 2.  **Compilation:** The C program is compiled into two versions using `compile.sh`:
-    * `dummy_ssl_unstripped`: Compiled with debug symbols and as non-PIE (`-no-pie`).
-    * `dummy_ssl_stripped`: A copy of the unstripped version, subsequently processed with `strip` to remove symbols.
-3.  **Offset Discovery:** The `find_offsets.sh` script analyzes the `dummy_ssl_unstripped` binary using `nm` to find the file offsets (addresses relative to the start of the file) for the `dummy_SSL_read` and `dummy_SSL_write` functions.
+    *   `dummy_ssl_unstripped`: Compiled with debug symbols and as non-PIE (`-no-pie`).
+    *   `dummy_ssl_stripped`: A copy of the unstripped version, subsequently processed with `strip` to remove symbols.
+3.  **Relative Offset Discovery:** The `find_offsets.sh` script analyzes the `dummy_ssl_unstripped` binary using `nm` and `readelf`. It calculates the offset of the target function *relative* to the start of its code section (`.text`), adding a 4-byte adjustment for the `endbr64` instruction. This `relative_offset` is exported.
 4.  **eBPF Program:** A basic eBPF C program (`bpf_program.c`) is created to simply print messages to the kernel trace pipe when the probes are triggered (`bpf_printk`).
-5.  **Go Loader:** A Go program (`goloader/main.go`) uses the `cilium/ebpf` library to:
-    * Load the compiled eBPF program.
-    * Take the target binary path (`./dummy_ssl_stripped`) and the calculated function offsets as command-line arguments.
-    * Attempt to attach the eBPF probes to the **stripped** binary using the provided offsets.
+5.  **Go Loader & Final Offset Calculation:** A Go program (`goloader/main.go`) uses the `cilium/ebpf` library. It:
+    *   Takes the target binary path (`./dummy_ssl_stripped`) and the *relative offsets* (from `find_offsets.sh`) as command-line arguments.
+    *   Finds the *base file offset* (`stripped_base_offset`) of the executable code segment in the *stripped* binary using the `debug/elf` package.
+    *   Calculates the *final absolute file offset* for the probe: `final_probe_offset = stripped_base_offset + relative_offset`.
+    *   Attaches the eBPF probes to the **stripped** binary using this `final_probe_offset` in the `Address` field of `link.UprobeOptions` (with `Offset: 0`).
 6.  **Verification:** The `run_poc.sh` script orchestrates the build and offset discovery, then provides instructions for manually running the Go loader, the trace pipe monitor, and the stripped C program to observe if the hooks trigger.
 
 ## Components
@@ -69,7 +70,7 @@ The `run_poc.sh` script will print these instructions after a successful build:
     # Example command printed by run_poc.sh:
     sudo ./ebpf_loader ./dummy_ssl_stripped 0x<offset_read> 0x<offset_write>
     ```
-    *(Observe the output. Based on current findings, this command is expected to **fail** with an error like "symbol _start: not found".)*
+    *(Wait for "Probes attached — waiting for trace events..." message)*
 
 2.  **Terminal 2 (Trace Monitor):** Monitor the kernel trace pipe:
     ```bash
@@ -81,3 +82,37 @@ The `run_poc.sh` script will print these instructions after a successful build:
     ./dummy_ssl_stripped
     ```
     Press Enter when prompted.
+
+## Expected Output
+
+When the `dummy_ssl_stripped` program calls `dummy_SSL_read` and `dummy_SSL_write`, you should see messages like the following appearing in **Terminal 2** (the trace pipe):
+
+<...>- (...) [00N] .... : bpf_printk: eBPF: dummy_SSL_read ENTERED! <...>- (...) [00N] .... : bpf_printk: eBPF: dummy_SSL_write ENTERED! <...>- (...) [00N] .... : bpf_printk: eBPF: dummy_SSL_write EXITED!
+
+*(Repeat for each iteration in the C program)*
+
+Press `Ctrl+C` in Terminal 1 to stop the eBPF loader and detach the probes.
+
+## File Structure
+
+*   `dummy_ssl.c`: Target C application.
+*   `bpf_program.c`: eBPF probe code.
+*   `goloader/`: Directory containing the Go eBPF loader source (`main.go`, `go.mod`, `go.sum`).
+*   `compile.sh`: Builds all components.
+*   `find_offsets.sh`: Calculates *relative* offsets from the unstripped binary.
+*   `run_poc.sh`: Orchestrates the execution and provides instructions.
+*   `README.md`: This file.
+*   `LICENSE`: License information (assuming MIT + component licenses).
+*   `.gitignore`: Specifies files to be ignored by Git.
+*   *(Build Outputs)*: `dummy_ssl_unstripped`, `dummy_ssl_stripped`, `bpf_program.o`, `ebpf_loader`.
+
+## License
+
+This project uses the MIT License for the user-provided code. Please see the `LICENSE` file (if created) for details and information on component licenses (GPL for eBPF, Apache 2.0 for cilium/ebpf).
+
+## Notes
+
+*   The success of this specific offset calculation method (`stripped_base_file_offset + relative_offset` passed to `Address`) has been confirmed in the environment where this POC was developed. However, eBPF interactions can sometimes vary subtly between kernel versions or library updates.
+*   This POC assumes that the relative order and offsets of instructions *within* the `.text` section are preserved during the `strip` process, which is generally true for standard `strip` usage.
+*   The `endbr64` adjustment (+4 bytes) is specific to binaries compiled with CET/IBT enabled. This might need adjustment if different compiler flags are used or if the target function doesn't have this instruction.
+*   The binary is compiled as non-PIE (`-no-pie`). Probing Position Independent Executables (PIE) might require different offset calculations or handling, as addresses are relative to a base that changes with ASLR even before considering stripping.

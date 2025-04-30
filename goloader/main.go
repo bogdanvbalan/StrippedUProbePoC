@@ -1,6 +1,7 @@
 package main
 
 import (
+	"debug/elf"
 	"errors"
 	"fmt"
 	"log"
@@ -10,106 +11,144 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/cilium/ebpf/rlimit" // Needed again
-
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -Wall" bpf ../bpf_program.c -- -I/usr/include/x86_64-linux-gnu -I../headers -I/usr/include
 
 func main() {
 	if len(os.Args) < 4 {
-		log.Fatalf("Usage: %s <path_to_stripped_binary> <hex_offset_read> <hex_offset_write>", os.Args[0])
+		log.Fatalf("Usage: %s <path_to_stripped_binary> <hex_relative_offset_read> <hex_relative_offset_write>", os.Args[0])
 	}
 	binPath := os.Args[1]
-	offsetReadHex := os.Args[2]
-	offsetWriteHex := os.Args[3]
+	relativeOffsetReadHex := os.Args[2]
+	relativeOffsetWriteHex := os.Args[3]
 
-	// Add rlimit removal back
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal("Removing memlock:", err)
 	}
 
-	// Parse hex offsets
-	offsetRead, err := parseHex(offsetReadHex)
+	// Parse hex relative offsets (from unstripped binary)
+	relativeOffsetRead, err := parseHex(relativeOffsetReadHex)
 	if err != nil {
-		log.Fatalf("Invalid read offset %q: %v", offsetReadHex, err)
+		log.Fatalf("Invalid read relative offset %q: %v", relativeOffsetReadHex, err)
 	}
-	offsetWrite, err := parseHex(offsetWriteHex)
+	relativeOffsetWrite, err := parseHex(relativeOffsetWriteHex)
 	if err != nil {
-		log.Fatalf("Invalid write offset %q: %v", offsetWriteHex, err)
+		log.Fatalf("Invalid write relative offset %q: %v", relativeOffsetWriteHex, err)
 	}
 
 	log.Printf("Target binary: %s", binPath)
-	log.Printf("Read Offset:   0x%x (%d)", offsetRead, offsetRead)
-	log.Printf("Write Offset:  0x%x (%d)", offsetWrite, offsetWrite)
+	log.Printf("Read Relative Offset:   0x%x (%d)", relativeOffsetRead, relativeOffsetRead)
+	log.Printf("Write Relative Offset:  0x%x (%d)", relativeOffsetWrite, relativeOffsetWrite)
 
-	// Load pre-compiled programs and maps into the kernel.
+	// Determine base file offset of the .text segment in the stripped binary
+	strippedBaseOffset, err := findStrippedExecutableSegmentOffset(binPath)
+	if err != nil {
+		log.Fatalf("Could not find base file offset in stripped binary '%s': %v", binPath, err)
+	}
+	log.Printf("Base file offset (stripped): 0x%x (%d)", strippedBaseOffset, strippedBaseOffset)
+
+	// Compute absolute file offsets by adding base + relative symbol offsets
+	fileOffsetRead := strippedBaseOffset + relativeOffsetRead
+	fileOffsetWrite := strippedBaseOffset + relativeOffsetWrite
+	log.Printf("Computed READ probe file offset:  0x%x", fileOffsetRead)
+	log.Printf("Computed WRITE probe file offset: 0x%x", fileOffsetWrite)
+
+	// Load compiled BPF objects
 	objs := bpfObjects{}
-	if err = loadBpfObjects(&objs, nil); err != nil {
+	if err := loadBpfObjects(&objs, nil); err != nil {
 		log.Fatalf("Loading BPF objects: %v", err)
 	}
 	defer objs.Close()
 
-	ex, err := link.OpenExecutable(binPath)
+	exe, err := link.OpenExecutable(binPath)
 	if err != nil {
 		log.Fatalf("Opening executable '%s': %v", binPath, err)
 	}
 
-	log.Printf("Attaching uprobe READ using offset + dummy symbol...")
-	upRead, err := ex.Uprobe("", objs.UprobeReadEntry, &link.UprobeOptions{
-		Address: offsetRead,
-		Offset:  0,
+	// READ probe
+	log.Printf("Attaching uprobe READ at file offset=0x%x", fileOffsetRead)
+	upRead, err := exe.Uprobe("", objs.UprobeReadEntry, &link.UprobeOptions{
+		Address: fileOffsetRead,
 	})
 	if err != nil {
-		log.Fatalf("Attaching uprobe to read offset 0x%x (symbol _start): %v", offsetRead, err)
+		log.Fatalf("Attaching uprobe READ failed: %v", err)
 	}
 	defer upRead.Close()
-	log.Printf("Attached uprobe to dummy_SSL_read at offset 0x%x", offsetRead)
+	log.Println("Attached uprobe READ")
 
-	log.Printf("Attaching uprobe WRITE using offset + dummy symbol...")
-	upWrite, err := ex.Uprobe("", objs.UprobeWriteEntry, &link.UprobeOptions{
-		Address: offsetWrite,
-		Offset:  0,
+	// WRITE entry probe
+	log.Printf("Attaching uprobe WRITE at file offset=0x%x", fileOffsetWrite)
+	upWrite, err := exe.Uprobe("", objs.UprobeWriteEntry, &link.UprobeOptions{
+		Address: fileOffsetWrite,
 	})
 	if err != nil {
-		log.Fatalf("Attaching uprobe to write offset 0x%x (symbol _start): %v", offsetWrite, err)
+		log.Fatalf("Attaching uprobe WRITE failed: %v", err)
 	}
 	defer upWrite.Close()
-	log.Printf("Attached uprobe to dummy_SSL_write entry at offset 0x%x", offsetWrite)
+	log.Println("Attached uprobe WRITE")
 
-	log.Printf("Attaching uretprobe WRITE using offset + dummy symbol...")
-	urpWrite, err := ex.Uretprobe("", objs.UretprobeWriteExit, &link.UprobeOptions{
-		Address: offsetWrite,
-		Offset:  0,
+	// WRITE exit probe (uretprobe)
+	log.Printf("Attaching uretprobe WRITE at file offset=0x%x", fileOffsetWrite)
+	upRet, err := exe.Uretprobe("", objs.UretprobeWriteExit, &link.UprobeOptions{
+		Address: fileOffsetWrite,
 	})
 	if err != nil {
-		log.Fatalf("Attaching uretprobe to write offset 0x%x (symbol _start): %v", offsetWrite, err)
+		log.Fatalf("Attaching uretprobe WRITE failed: %v", err)
 	}
-	defer urpWrite.Close()
-	log.Printf("Attached uretprobe to dummy_SSL_write exit at offset 0x%x", offsetWrite)
+	defer upRet.Close()
+	log.Println("Attached uretprobe WRITE")
 
-	log.Println("Successfully attached eBPF probes (using offset + dummy symbol). Waiting for events...")
-	log.Println("Run the target program now, and watch for output in:")
-	log.Println("sudo cat /sys/kernel/debug/tracing/trace_pipe")
-	log.Println("Press Ctrl+C to stop.")
+	log.Println("Probes attached — waiting for trace events (trace_pipe)...")
 
 	// Wait for termination signal
-	stopper := make(chan os.Signal, 1)
-	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
-	<-stopper
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
 
-	log.Println("Received signal, detaching probes and exiting.")
+	log.Println("Detaching probes and exiting.")
 }
 
 func parseHex(hexStr string) (uint64, error) {
-	cleaned := strings.TrimPrefix(strings.ToLower(hexStr), "0x")
-	if cleaned == "" {
+	clean := strings.TrimPrefix(strings.ToLower(hexStr), "0x")
+	if clean == "" {
 		return 0, errors.New("empty hex string")
 	}
-	val, err := strconv.ParseUint(cleaned, 16, 64)
+	v, err := strconv.ParseUint(clean, 16, 64)
 	if err != nil {
 		return 0, fmt.Errorf("parsing hex '%s': %w", hexStr, err)
 	}
-	return val, nil
+	return v, nil
+}
+
+func findStrippedExecutableSegmentOffset(path string) (uint64, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("elf.Open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	// Inspect PT_LOAD segments for debugging
+	log.Println("Inspecting program headers:")
+	for _, prog := range f.Progs {
+		log.Printf("  Type=%v Flags=%v Off=0x%x Vaddr=0x%x", prog.Type, prog.Flags, prog.Off, prog.Vaddr)
+	}
+
+	// Prefer .text section offset when available
+	if sec := f.Section(".text"); sec != nil && sec.Offset != 0 {
+		log.Printf("Using .text section offset: Off=0x%x, Addr=0x%x", sec.Offset, sec.Addr)
+		return sec.Offset, nil
+	}
+
+	// Otherwise, pick the first executable PT_LOAD
+	for _, prog := range f.Progs {
+		if prog.Type == elf.PT_LOAD && (prog.Flags&elf.PF_X) != 0 {
+			log.Printf("Selected PT_LOAD exec segment: Off=0x%x, Vaddr=0x%x", prog.Off, prog.Vaddr)
+			return prog.Off, nil
+		}
+	}
+
+	return 0, errors.New("no executable segment or .text section found")
 }

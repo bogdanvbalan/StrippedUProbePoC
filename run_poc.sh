@@ -10,7 +10,7 @@ source ./find_offsets.sh
 
 # Check if offsets were found and exported
 if [ -z "$DUMMY_READ_OFFSET" ] || [ -z "$DUMMY_WRITE_OFFSET" ]; then
-    echo "Error: Offsets not found or not set after sourcing find_offsets.sh. Exiting." # Modified message
+    echo "Error: Offsets not found or not set after sourcing find_offsets.sh. Exiting."
     exit 1
 fi
 
